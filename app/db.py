@@ -142,28 +142,35 @@ class Store:
 
     # ------------------------------------------------------------------ refs
 
-    def pin(self, instance_id: str, now: float | None = None):
-        """Pin the current version for an in-flight query.
+    def pin(self, instance_id: str, now: float | None = None,
+            version: int | None = None):
+        """Pin a published version for an in-flight query.
 
-        Returns (version, chrom, path, ref_id) or None when nothing is published.
-        The read of the current pointer and the ref insert are one transaction,
-        so the reaper can never delete a version between the two steps.
+        With `version=None` the current version is pinned; an explicit version
+        pins that exact published version (so a caller can keep working on a
+        fixed version while another instance publishes a replacement).
+        Returns (version, chrom, path, ref_id), or None when no published
+        version matches.  The lookup and the ref insert are one transaction,
+        so the reaper can never delete the version between the two steps.
         """
         now = time.time() if now is None else now
         with self._txn() as con:
-            cur = int(con.execute("SELECT v FROM meta WHERE k = 'current_version'").fetchone()["v"])
-            if cur == 0:
-                return None
+            if version is None:
+                version = int(
+                    con.execute("SELECT v FROM meta WHERE k = 'current_version'").fetchone()["v"]
+                )
+                if version == 0:
+                    return None
             row = con.execute(
-                "SELECT chrom, path FROM versions WHERE version = ?", (cur,)
+                "SELECT chrom, path FROM versions WHERE version = ?", (version,)
             ).fetchone()
-            if row is None:  # pragma: no cover - defensive, should not happen
+            if row is None:
                 return None
             c = con.execute(
                 "INSERT INTO refs(version, instance, created_at) VALUES (?, ?, ?)",
-                (cur, instance_id, now),
+                (version, instance_id, now),
             )
-            return cur, row["chrom"], row["path"], c.lastrowid
+            return version, row["chrom"], row["path"], c.lastrowid
 
     def unpin(self, ref_id: int) -> None:
         with self._txn() as con:

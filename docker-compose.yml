@@ -1,6 +1,7 @@
 services:
   app1:
     build: .
+    restart: unless-stopped
     environment:
       VCF_DATA_DIR: /data
       VCF_INSTANCE_ID: app1
@@ -8,9 +9,15 @@ services:
       - vcfdata:/data
     ports:
       - "8001:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/docs')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
   app2:
     build: .
+    restart: unless-stopped
     environment:
       VCF_DATA_DIR: /data
       VCF_INSTANCE_ID: app2
@@ -18,6 +25,11 @@ services:
       - vcfdata:/data
     ports:
       - "8002:8000"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/docs')"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
 
 volumes:
   vcfdata:

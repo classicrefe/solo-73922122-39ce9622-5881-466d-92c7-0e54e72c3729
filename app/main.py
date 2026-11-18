@@ -25,11 +25,39 @@ from dataclasses import dataclass
 import pysam
 from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel, Field
 
 from .db import Conflict, Store
+from .haplotype import (
+    FastaError,
+    HaplotypeError,
+    apply_variants,
+    check_interval,
+    fetch_intersecting,
+    parse_fasta,
+    resolve_chrom,
+    validate_records,
+)
 from .vcfbuild import GZ_NAME, VCFError, validate_and_build
 
 DEFAULT_MAX_UPLOAD = 10 * 1024 * 1024  # 10 MiB
+
+
+class HaplotypeResponse(BaseModel):
+    """Alternate sequence for one interval of one pinned VCF version."""
+
+    version: int = Field(description="VCF version the sequence was built from")
+    chrom: str
+    start: int = Field(description="1-based interval start (inclusive)")
+    end: int = Field(description="1-based interval end (inclusive)")
+    reference: str = Field(description="Reference bases of the interval")
+    sequence: str = Field(
+        description="Alternate sequence after applying the participating records"
+    )
+    count: int = Field(description="Number of participating records")
+    records: list[str] = Field(
+        description="VCF records that intersect the interval, sorted by position"
+    )
 
 
 @dataclass
@@ -144,7 +172,9 @@ def create_app(config: Config | None = None) -> FastAPI:
             "Tabix-indexed. Query 1-based closed intervals; every record whose "
             "reference span [POS, POS+len(REF)-1] intersects the interval is "
             "returned via the index. Uploads are optimistic-concurrency "
-            "controlled through `base_version`."
+            "controlled through `base_version`. POST /haplotype overlays the "
+            "records intersecting one interval (max 100,000 bases) onto an "
+            "uploaded reference FASTA and returns the alternate sequence."
         ),
     )
     app.state.cfg = cfg
@@ -249,6 +279,97 @@ def create_app(config: Config | None = None) -> FastAPI:
             }
         finally:
             store.unpin(ref_id)
+
+    @app.post("/haplotype", response_model=HaplotypeResponse)
+    async def build_haplotype(
+        file: UploadFile = File(..., description="Single-chromosome ACGT reference FASTA"),
+        chrom: str | None = Query(
+            None,
+            description="Chromosome name; must match both the FASTA record and the dataset "
+            "(may be omitted when the FASTA header names it)",
+        ),
+        start: int = Query(..., ge=1, description="1-based interval start (inclusive)"),
+        end: int = Query(..., ge=1, description="1-based interval end (inclusive)"),
+        version: int | None = Query(
+            None,
+            ge=1,
+            description="VCF version to apply; defaults to the version current when the "
+            "request starts",
+        ),
+    ):
+        """Build the alternate DNA sequence for one reference interval.
+
+        The whole reference FASTA is uploaded (at most 10 MiB) and validated,
+        then every published record whose reference span intersects the
+        interval is overlaid as one haplotype.  The VCF version is pinned
+        before the upload is read and used for the whole request: a
+        replacement published by another instance mid-request cannot change
+        which list this build applies.
+        """
+        # Pin first: whichever version this request starts on is the one it
+        # uses end-to-end, even if the other instance publishes meanwhile.
+        pinned = store.pin(cfg.instance_id, time.time(), version)
+        if pinned is None:
+            if version is not None:
+                raise HTTPException(
+                    404,
+                    f"version {version} is not available (never published, or "
+                    "already reclaimed)",
+                )
+            raise HTTPException(404, "no VCF has been published yet")
+        version_id, vchrom, rel, ref_id = pinned
+        try:
+            data = bytearray()
+            while True:
+                chunk = await file.read(1 << 20)
+                if not chunk:
+                    break
+                data.extend(chunk)
+                if len(data) > cfg.max_upload_bytes:
+                    raise HTTPException(
+                        413, f"upload exceeds the {cfg.max_upload_bytes}-byte limit"
+                    )
+            try:
+                fasta = await asyncio.to_thread(parse_fasta, bytes(data))
+            except FastaError as exc:
+                raise HTTPException(400, f"invalid FASTA: {exc}")
+            try:
+                check_interval(start, end, len(fasta.sequence))
+            except HaplotypeError as exc:
+                raise HTTPException(400, str(exc))
+
+            try:
+                target = resolve_chrom(chrom, fasta.name, vchrom)
+                gz_path = os.path.join(cfg.data_dir, rel, GZ_NAME)
+                lines = await asyncio.to_thread(
+                    fetch_intersecting, gz_path, target, start, end
+                )
+                variants = await asyncio.to_thread(
+                    validate_records, lines, fasta.sequence
+                )
+                sequence = apply_variants(fasta.sequence, start, end, variants)
+            except HaplotypeError as exc:
+                raise HTTPException(400, str(exc))
+            except HTTPException:
+                raise
+            except Exception as exc:
+                raise HTTPException(500, f"indexed fetch failed: {exc}")
+        finally:
+            # Synchronous on purpose: unpinning must also happen when the
+            # request task is cancelled (client disconnect).  It is one tiny
+            # indexed DELETE, so blocking the loop here is harmless.
+            store.unpin(ref_id)
+
+        return HaplotypeResponse(
+            version=version_id,
+            chrom=target,
+            start=start,
+            end=end,
+            reference=fasta.sequence[start - 1:end],
+            sequence=sequence,
+            count=len(variants),
+            records=[v.line for v in variants],
+        )
 
     @app.get("/version")
     def get_version():
